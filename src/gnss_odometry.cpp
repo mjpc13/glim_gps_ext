@@ -4,6 +4,11 @@
 #include <glim/util/logging.hpp>
 #include <glim/util/config.hpp>
 #include <glim/util/concurrent_vector.hpp>
+#include <glim/util/convert_to_string.hpp>
+
+
+#include <gtsam_points/optimizers/isam2_result_ext.hpp>
+#include <gtsam_points/optimizers/isam2_ext.hpp>
 
 #include <Eigen/Core>
 #include <Eigen/Dense>
@@ -16,6 +21,9 @@
 
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/nav_sat_fix.hpp"
+
+#include <gtsam/inference/Symbol.h>
+#include <gtsam/geometry/Pose3.h>
 
 #include <gtsam/slam/PoseTranslationPrior.h>
 #include <gtsam/nonlinear/NonlinearFactor.h>
@@ -43,6 +51,7 @@ struct GNSS
 
 
 using namespace glim;
+using gtsam::symbol_shorthand::X;
 
 class GnssExtensionModule : public ExtensionModuleROS2 {
 public:
@@ -55,10 +64,14 @@ public:
     using std::placeholders::_3;
     using std::placeholders::_4;
     
-    //OdometryEstimationCallbacks::on_new_frame.add(std::bind(&GnssExtensionModule::on_new_frame, this, _1));
-    OdometryEstimationCallbacks::on_smoother_update.add(std::bind(&GnssExtensionModule::on_smoother_update_odometry, this, _1, _2, _3, _4));
-
+    GlobalMappingCallbacks::on_smoother_update.add(std::bind(&GnssExtensionModule::on_smoother_update_global, this, _1, _2, _3));
     GlobalMappingCallbacks::on_insert_submap.add(std::bind(&GnssExtensionModule::on_insert_submap, this, _1));
+    GlobalMappingCallbacks::on_smoother_update_result.add(std::bind(&GnssExtensionModule::on_smoother_update_result, this, _1, _2));
+
+
+    // TODO: Add a config file thing so I can easily pass parameters.
+
+    // TODO: Maybe re-fine GNSS->IMU pose online?
 
     logger->info("GNSS extension module initialized");
 
@@ -67,6 +80,7 @@ public:
   }
 
   ~GnssExtensionModule(){
+    // Write the T_world_ecef to a file
     kill_switch = true;
     thread.join();
   }
@@ -85,18 +99,40 @@ public:
     return {sub};
   }
 
+    void on_smoother_update_global(gtsam_points::ISAM2Ext& isam2, gtsam::NonlinearFactorGraph& new_factors, gtsam::Values& new_values){
 
+        const auto factors = output_factors.get_all_and_clear();
+        if (!factors.empty()) {
+            new_factors.add(factors.back());
+            current_factor = factors.back();
+            //new_factors.print();
+        }
 
-    void on_smoother_update_odometry(gtsam_points::IncrementalFixedLagSmootherExtWithFallback& smoother,
-                            gtsam::NonlinearFactorGraph& new_factors,
-                            gtsam::Values& new_values,
-                            std::map<std::uint64_t, double>& new_stamps) 
-    {
-            
+    }
+
+    void on_smoother_update_result(gtsam_points::ISAM2Ext& isam2, const gtsam_points::ISAM2ResultExt& result) {
+
+// TODO: Understand how I can warn if the GNSS factors are not aligning with the rest of factors.
+//        if (ecef2local_initialized){
+//
+//            if (isam2.valueExists(X(current_submap->id))) {
+//                
+//                logger->info("The result thing for node {}: ", current_submap->id);
+//                
+//                auto info_matrix = isam2.marginalFactor(X(current_submap->id))->augmentedInformation();
+//                auto cov = isam2.marginalCovariance(X(current_submap->id));
+//                std::cout << " " << info_matrix << " " << std::endl;
+//
+//            }
+//
+//        }
+
     }
 
 
-  void on_insert_submap(const SubMap::ConstPtr& submap) { input_submap_queue.push_back(submap); }
+    void on_insert_submap(const SubMap::ConstPtr& submap) { 
+        input_submap_queue.push_back(submap); 
+    }
 
   private:
 
@@ -110,10 +146,13 @@ public:
     double kFirstEccentricitySquared = 6.69437999014 * 0.001;
     double kSecondEccentricitySquared = 6.73949674228 * 0.001;
     double kFlattening = 1 / 298.257223563;
-    double baseline_min = 5; // needs to walk 5m for the GNSS to compute the T_world_UTM
+    double baseline_min = 5; // needs to walk 5m for the GNSS to compute the T_world_ecef
     
-    double kMaxTimeDiff = 0.01; // 50 ms 
+    double kMaxTimeDiff = 0.05; // 50 ms 
 
+
+    SubMap::ConstPtr current_submap;
+    gtsam::NonlinearFactor::shared_ptr current_factor;
 
 
     bool ecef2local_initialized = false;
@@ -121,7 +160,8 @@ public:
     ConcurrentVector<GNSS> input_gnss_queue;
     ConcurrentVector<SubMap::ConstPtr> input_submap_queue;
 
-    Eigen::Isometry3d T_world_utm;
+    ConcurrentVector<gtsam::NonlinearFactor::shared_ptr> output_factors;
+    Eigen::Isometry3d T_world_ecef;
 
 
     void backend_task(){
@@ -129,11 +169,11 @@ public:
         std::deque<GNSS> gnss_queue;
         std::deque<SubMap::ConstPtr> submap_queue;
 
-        std::vector<Eigen::Vector3d> submap_positions;
-        std::vector<Eigen::Vector3d> gnss_positions;
-
         while (!kill_switch)
         {
+
+            std::deque<GNSS> gnss_matched;
+            std::deque<SubMap::ConstPtr> submap_matched;
 
             const auto gnss_data = input_gnss_queue.get_all_and_clear();
             const auto new_submaps = input_submap_queue.get_all_and_clear();
@@ -159,11 +199,9 @@ public:
             
                 if (std::abs(dt) < kMaxTimeDiff) {
                     // MATCH FOUND
-                    submap_positions.push_back(
-                        submap_queue[i]->T_world_origin.translation());
-                    gnss_positions.push_back(
-                        gnss_queue[j].position);
-                    
+                    submap_matched.push_back(submap_queue[i]);
+                    gnss_matched.push_back(gnss_queue[j]);
+
                     ++i;
                     ++j;
                 }
@@ -178,38 +216,59 @@ public:
             }
 
 
-            //Compute the T_world_utm in case it does not exist yet!
-            if(!ecef2local_initialized && !input_gnss_queue.empty() && !submap_queue.empty()){
+            //Compute the T_world_ecef in case it does not exist yet!
+            if(!ecef2local_initialized && !submap_matched.empty() && !gnss_matched.empty()){
                 //Check if the distance between first and last is greater than the min_baseline
 
-                double baseline = (submap_queue.front()->T_world_origin.inverse() * submap_queue.back()->T_world_origin).translation().norm();
+                double baseline = (submap_matched.front()->T_world_origin.inverse() * submap_matched.back()->T_world_origin).translation().norm();
 
                 if (baseline >= baseline_min){
-                    logger->info("About to initialize T_world_utm.");
-                    Eigen::MatrixXd X(3, submap_positions.size());
-                    Eigen::MatrixXd Y(3, gnss_positions.size());
+                    logger->info("About to initialize T_world_ecef.");
+                    Eigen::MatrixXd X(3, submap_matched.size());
+                    Eigen::MatrixXd Y(3, gnss_matched.size());
 
-                    for (size_t i = 0; i < gnss_positions.size(); ++i) {
-                        X.col(i) = submap_positions[i];
-                        Y.col(i) = gnss_positions[i];
+                    for (size_t i = 0; i < gnss_matched.size(); ++i) {
+                        X.col(i) = submap_matched[i]->T_world_origin.translation();
+                        Y.col(i) = gnss_matched[i].position;
                     }
 
                     Eigen::Matrix4d T_mat = Eigen::umeyama(X, Y, false); //Umeyama's transform to align 2 trajectories
 
-                    Eigen::Isometry3d T_utm_world(T_mat);
-                    T_world_utm = T_utm_world.inverse();
+                    Eigen::Isometry3d T_ecef_world(T_mat);
+                    T_world_ecef = T_ecef_world.inverse();
 
 
                     ecef2local_initialized = true;
 
                 }
-
-                std::cout << "\033[32m"  // Yellow (closest standard ANSI color to orange)
-                   << "[Estimation]: " << submap_queue.front()->T_world_origin.translation()
-                   << "\033[0m" << std::endl;
-                sleep(1);
-
             }
+
+            if (ecef2local_initialized) {
+
+                std::deque<GNSS> gnss_queue;
+                std::deque<SubMap::ConstPtr> submap_queue;
+
+                const auto& submap = submap_matched.back();
+                const auto& gnss = gnss_matched.back();
+
+                Eigen::Vector3d xyz = T_world_ecef * gnss.position;
+
+                Eigen::Matrix3d cov = gnss.covariance;
+
+                auto gaussian = gtsam::noiseModel::Gaussian::Covariance(cov);
+
+                // TODO: Create a parameter to control the Huber param
+                auto robust = gtsam::noiseModel::Robust::Create(
+                                gtsam::noiseModel::mEstimator::Huber::Create(1.345),
+                                gaussian
+                            );
+
+                //TODO: Create a GNSS Factor Instead of PosePrior AND connect it to the IMU node, not submap->id 
+                gtsam::NonlinearFactor::shared_ptr factor(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, robust));
+                current_submap = submap;
+                output_factors.push_back(factor);
+            }
+
 
         }
         
@@ -220,8 +279,8 @@ public:
     {
         GNSS gnss_msg;
         gnss_msg.stamp = to_sec(msg->header.stamp);
-
         gnss_msg.position = wgs84_to_ecef(msg->latitude, msg->longitude, msg->altitude);
+
         gnss_msg.covariance <<  msg->position_covariance[0], 
                                 msg->position_covariance[1],
                                 msg->position_covariance[2],
@@ -233,15 +292,8 @@ public:
                                 msg->position_covariance[8];
 
         if(!ecef2local_initialized){
-            std::cout << "\033[33m"  // Yellow (closest standard ANSI color to orange)
-               << "[WGS84]: " << msg->latitude << " " << msg->longitude << " " << msg->altitude
-               << "\033[0m" << std::endl;
-        } else{
-
-            auto test = T_world_utm * gnss_msg.position;
-            std::cout << "\033[33m"  // Yellow (closest standard ANSI color to orange)
-               << "[ENU]: " << test.x() << " " << test.y() << " " << test.z()
-               << "\033[0m" << std::endl;
+            auto gnss_debug = T_world_ecef * gnss_msg.position;
+            logger->debug("[ECEF] GNSS Reported Position (x,y,z): ({},{},{})", gnss_debug.x(), gnss_debug.y(), gnss_debug.z());
         }
 
 
